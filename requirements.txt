@@ -1,0 +1,10 @@
+PyYAML
+numpy
+pandas
+torch
+tensorboard
+packaging
+datasets
+transformers
+peft
+bitsandbytes
