@@ -2,6 +2,8 @@
 
 This repository provides the implementation of **TPP-LLM**, a framework that integrates Temporal Point Processes (TPPs) with Large Language Models (LLMs) for event sequence prediction. The repository includes scripts for training and evaluating the TPP-LLM model on various real-world datasets. For more details on the methodology and experiments, please refer to our [paper]().
 
+![TPP-LLM Framework](images/tpp_llm.png)
+
 ## Features
 
 - **Semantic and Temporal Modeling**: Combines LLMs with TPPs to capture both the semantic richness of event descriptions and the temporal dynamics of event sequences.
