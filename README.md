@@ -40,7 +40,7 @@ You can adjust the configuration to run experiments on other datasets by selecti
 
 ## Datasets
 
-The datasets used in this project can be downloaded and preprocessed by running the notebook [`notebooks/tpp_data.ipynb`](notebooks/tpp_data.ipynb). This notebook will handle downloading, cleaning, and preparing the datasets for training. Supported datasets include:
+The cleaned data used in this project can be downloaded from [Hugging Face](https://huggingface.co/tppllm). Or you can download and preprocess raw data by running the notebook [`notebooks/tpp_data.ipynb`](notebooks/tpp_data.ipynb). Supported datasets include:
 
 - Stack Overflow
 - Chicago Crime
