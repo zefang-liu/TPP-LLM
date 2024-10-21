@@ -10,9 +10,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from tpp_llm.data import TPPLLMDataset, collate_fn
 from tpp_llm.model import TPPLLMModel
-from tpp_llm.utils import get_prompt
 
 
 class TPPLLMRunner(object):
@@ -21,13 +19,11 @@ class TPPLLMRunner(object):
     """
 
     def __init__(
-        self, model: TPPLLMModel, learning_rate: float, beta_type: float = 1, beta_time: float = 1,
-        device: Union[str, torch.device] = 'cpu'):
+        self, model: TPPLLMModel, beta_type: float = 1, beta_time: float = 1, device: Union[str, torch.device] = 'cpu'):
         """
         Initialize the TPP-LLM runner
 
         :param model: TPP-LLM model
-        :param learning_rate: learning rate
         :param beta_type: coefficient for the event type prediction loss
         :param beta_time: coefficient for the event time prediction loss
         :param device: device
@@ -35,9 +31,14 @@ class TPPLLMRunner(object):
         self.model = model
         self.beta_type = beta_type
         self.beta_time = beta_time
-        self.learning_rate = learning_rate
-        self.optimizer = Adam(params=self.model.parameters(), lr=self.learning_rate)
         self.device = torch.device(device)
+
+        self.num_train_epochs = 0
+        self.num_training_steps = 0
+        self.num_warmup_steps = 0
+        self.global_step = 0
+        self.scheduler = None
+        self.optimizer = None
 
         self.move_to_numpy_prev = lambda list_tensors: [tensor[1:].numpy(force=True) for tensor in list_tensors]
         self.move_to_numpy_next = lambda list_tensors: [tensor[:-1].numpy(force=True) for tensor in list_tensors]
@@ -67,18 +68,26 @@ class TPPLLMRunner(object):
             batch_loss = torch.sum(
                 batch_nll_losses + self.beta_type * batch_type_losses + self.beta_time * batch_time_losses)
 
+            # Print metrics
+            batch_event_nums = batch_event_nums.numpy(force=True)
+            batch_log_likelihoods = - batch_nll_losses.numpy(force=True)
+            metrics = {
+                'batch_loss': batch_loss.float().cpu().item(),
+                'batch_event_nums': batch_event_nums.sum().item(),
+                'batch_log_likelihood': batch_log_likelihoods.sum().item() / batch_event_nums.sum().item(),
+                'learning_rate': self.optimizer.param_groups[0]['lr'],
+                'epoch': self.global_step / self.num_training_steps * self.num_train_epochs,
+            }
+            print(metrics)
+
             # Optimize the model parameters
             self.optimizer.zero_grad()
             batch_loss.backward()
             self.optimizer.step()
 
-            # Convert tensors
-            batch_event_nums = batch_event_nums.numpy(force=True)
-            batch_log_likelihoods = - batch_nll_losses.numpy(force=True)
-            print(
-                f"batch_loss: {batch_loss.numpy(force=True):.4f}, "
-                f"batch_event_nums: {np.sum(batch_event_nums):d}, "
-                f"batch_log_likelihood: {np.sum(batch_log_likelihoods) / np.sum(batch_event_nums):.4f}")
+            # Update the learning rate
+            self.scheduler.step()
+            self.global_step += 1
 
             return batch_event_nums, batch_log_likelihoods, [], [], [], []
 
@@ -105,13 +114,13 @@ class TPPLLMRunner(object):
         else:
             raise KeyError(f'Unknown phase: {phase}.')
 
-    def run_epoch(self, dataloader: DataLoader, phase: str):
+    def run_epoch(self, dataloader: DataLoader, phase: str) -> dict:
         """
         Run an epoch with batches of event sequences
 
         :param dataloader: data loader
         :param phase: running phase (train or eval)
-        :return:
+        :return: metrics
         """
 
         total_log_likelihood = 0
@@ -152,18 +161,66 @@ class TPPLLMRunner(object):
 
     def run(
         self, dataloader_train: DataLoader = None, dataloader_val: DataLoader = None,
-        dataloader_test: DataLoader = None, num_epochs: int = 1) -> None:
+        dataloader_test: DataLoader = None, learning_rate: float = 5e-4, lr_scheduler_type: str = 'constant',
+        num_train_epochs: int = 1, warmup_ratio: float = 0) -> None:
         """
         Run the training, validation, and testing for the model
 
         :param dataloader_train: data loader of the training set
         :param dataloader_val: data loader of the validation set
         :param dataloader_test: data loader of the testing set
-        :param num_epochs: number of epochs
+        :param learning_rate: learning rate
+        :param lr_scheduler_type: learning rate scheduler type
+        :param num_train_epochs: number of training epochs
+        :param warmup_ratio: warmup ratio
         """
+        # Calculate the number of training steps and the number of warmup steps
+        self.num_train_epochs = num_train_epochs
+        self.num_training_steps = self.num_train_epochs * len(dataloader_train)
+        self.num_warmup_steps = int(warmup_ratio * self.num_training_steps)
+        self.global_step = 0
+        self.optimizer = Adam(params=self.model.parameters(), lr=learning_rate)
+
+        # Initialize the learning rate scheduler
+        if lr_scheduler_type == 'constant':
+            self.scheduler = transformers.get_constant_schedule(
+                optimizer=self.optimizer,
+            )
+        elif lr_scheduler_type == 'constant_with_warmup':
+            self.scheduler = transformers.get_constant_schedule_with_warmup(
+                optimizer=self.optimizer,
+                num_warmup_steps=self.num_warmup_steps,
+            )
+        elif lr_scheduler_type == 'linear':
+            self.scheduler = transformers.get_linear_schedule_with_warmup(
+                optimizer=self.optimizer,
+                num_warmup_steps=self.num_warmup_steps,
+                num_training_steps=self.num_training_steps,
+            )
+        elif lr_scheduler_type == 'cosine':
+            self.scheduler = transformers.get_cosine_schedule_with_warmup(
+                optimizer=self.optimizer,
+                num_warmup_steps=self.num_warmup_steps,
+                num_training_steps=self.num_training_steps,
+                num_cycles=0.5,
+            )
+        else:
+            raise KeyError(f'Unknown learning rate scheduler type: {lr_scheduler_type}')
+
+        # Initial validation
         metrics_val_best = None
 
-        for epoch in range(num_epochs):
+        if dataloader_val:
+            metrics_val = self.run_epoch(dataloader_val, phase='eval')
+            print(f'validation metrics: {metrics_val}')
+            metrics_val_best = metrics_val
+
+        if dataloader_test:
+            metrics_test = self.run_epoch(dataloader_test, phase='eval')
+            print(f'test metrics: {metrics_test}')
+
+        # Start training loop
+        for epoch in range(num_train_epochs):
             print(f'epoch: {epoch}')
 
             if dataloader_train:
@@ -174,10 +231,7 @@ class TPPLLMRunner(object):
                 metrics_val = self.run_epoch(dataloader_val, phase='eval')
                 print(f'validation metrics of epoch {epoch}: {metrics_val}')
 
-                if metrics_val_best is None:
-                    metrics_val_best = metrics_val
-                    print(f'new best validation metrics')
-                elif metrics_val['log_likelihood'] > metrics_val_best['log_likelihood']:
+                if metrics_val_best is not None and metrics_val['log_likelihood'] > metrics_val_best['log_likelihood']:
                     metrics_val_best = metrics_val
                     print(f'new best validation metrics')
 

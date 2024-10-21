@@ -5,13 +5,12 @@ from typing import List, Dict, Tuple, Union
 
 import torch
 import torch.nn as nn
-import transformers
 from peft import get_peft_model, PeftConfig
 from torch import Tensor
 from torch.nn import functional
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 
-from tpp_llm.layers import TimePositionalEncoding
+from tpp_llm.layers import TimePositionalEncoding, TimeShiftedPositionalEncoding
 
 
 class TPPLLMModel(nn.Module):
@@ -46,6 +45,7 @@ class TPPLLMModel(nn.Module):
         self.llm = AutoModel.from_pretrained(
             model_name,
             quantization_config=bnb_config,
+            torch_dtype=torch.float32,
             device_map=self.device,
         )
 
@@ -67,26 +67,33 @@ class TPPLLMModel(nn.Module):
         self.num_event_types = num_event_types
         self.temporal_emb_type = temporal_emb_type
         self.temporal_emb_first = temporal_emb_first
+        self.dtype = self.llm.dtype
         self.prompt = prompt
 
         # Creat layers for computing intensities
-        self.intensity_current = nn.Linear(1, self.num_event_types, bias=True, device=self.device)
-        self.intensity_history = nn.Linear(self.hidden_size, self.num_event_types, bias=False, device=self.device)
+        self.intensity_current = nn.Linear(
+            1, self.num_event_types, bias=True, dtype=self.dtype, device=self.device)
+        self.intensity_history = nn.Linear(
+            self.hidden_size, self.num_event_types, bias=False, dtype=self.dtype, device=self.device)
         self.softplus = nn.Softplus()
 
         # Creat layers for predicting next events
         self.head_type = nn.Sequential(
-            nn.Linear(self.hidden_size, self.num_event_types, bias=True, device=self.device),
+            nn.Linear(self.hidden_size, self.num_event_types, bias=True, dtype=self.dtype, device=self.device),
             nn.Softmax(dim=-1))
-        self.head_time = nn.Linear(self.hidden_size, 1, bias=True, device=self.device)
+        self.head_time = nn.Linear(self.hidden_size, 1, bias=True, dtype=self.dtype, device=self.device)
 
         # Load the temporal embedding
         if self.temporal_emb_type == 'linear':
-            self.temporal_embedder = nn.Linear(1, self.embedding_dim, device=self.device)
+            self.temporal_embedder = nn.Linear(1, self.embedding_dim, dtype=self.dtype, device=self.device)
         elif self.temporal_emb_type == 'positional':
-            self.temporal_embedder = TimePositionalEncoding(embedding_dim=self.embedding_dim, device=device)
+            self.temporal_embedder = TimePositionalEncoding(
+                embedding_dim=self.embedding_dim, dtype=self.dtype, device=self.device)
+        elif self.temporal_emb_type == 'shifted':
+            self.temporal_embedder = TimeShiftedPositionalEncoding(
+                embedding_dim=self.embedding_dim, dtype=self.dtype, device=self.device)
         else:
-            raise KeyError(f'{self.temporal_emb_type} not implemented.')
+            raise KeyError(f'Temporal embedding type {self.temporal_emb_type} not implemented.')
 
         # Generate the prompt embedding
         self.prompt_embeddings = self.embed_event_text(event_texts=[self.prompt], add_special_tokens=True)[0]
@@ -110,11 +117,14 @@ class TPPLLMModel(nn.Module):
             for num_tokens, event_embedding_padded in zip(nums_tokens, event_embeddings_padded)]
         return event_embeddings
 
-    def forward(self, batch_event_times: List[Tensor], batch_event_texts: List[List[str]]) -> List[Tensor]:
+    def forward(
+        self, batch_event_times: List[Tensor], batch_event_time_deltas: List[Tensor],
+        batch_event_texts: List[List[str]]) -> List[Tensor]:
         """
         Forward function to get hidden states of event sequences in a batch
 
         :param batch_event_times: batch of event times in sequences, [(seq_len,), ...]
+        :param batch_event_time_deltas: batch of event time deltas in sequences, [(seq_len,), ...]
         :param batch_event_texts: batch of event texts in sequences, [(seq_len,), ...]
         :return: hidden states of events, [(seq_len, hidden_size), ...]
         """
@@ -123,7 +133,8 @@ class TPPLLMModel(nn.Module):
         batch_event_emb_indices = []
 
         # Process each event sequence in the batch
-        for event_times, event_texts in zip(batch_event_times, batch_event_texts):
+        for event_times, event_time_deltas, event_texts in zip(batch_event_times, batch_event_time_deltas,
+                                                               batch_event_texts):
             sequence_embeddings = []
             sequence_attention_mask = []
             event_emb_indices = []
@@ -134,7 +145,11 @@ class TPPLLMModel(nn.Module):
                 sequence_attention_mask.append(1)
 
             # Get the temporal embeddings for event times
-            temporal_embeddings = self.temporal_embedder(event_times.unsqueeze(-1))  # (seq_len, embedding_dim)
+            if self.temporal_emb_type == 'shifted':
+                temporal_embeddings = self.temporal_embedder(
+                    event_times.unsqueeze(-1), event_time_deltas.unsqueeze(-1))  # (seq_len, embedding_dim)
+            else:
+                temporal_embeddings = self.temporal_embedder(event_times.unsqueeze(-1))  # (seq_len, embedding_dim)
 
             # Get token embeddings for the event texts
             event_text_embeddings = self.embed_event_text(event_texts)  # [(text_token_len, embedding_dim), ...]
@@ -319,6 +334,7 @@ class TPPLLMModel(nn.Module):
         # Compute the hidden states
         batch_hidden_states = self.forward(
             batch_event_times=batch_event_times,
+            batch_event_time_deltas=batch_event_time_deltas,
             batch_event_texts=batch_event_texts)  # [(seq_len, hidden_size), ...]
 
         # Compute the log likelihoods
@@ -390,6 +406,7 @@ class TPPLLMModel(nn.Module):
         # Compute the hidden states
         batch_hidden_states = self.forward(
             batch_event_times=batch_event_times,
+            batch_event_time_deltas=batch_event_time_deltas,
             batch_event_texts=batch_event_texts)  # [(seq_len, hidden_size), ...]
 
         # Compute the log likelihoods

@@ -24,11 +24,11 @@ if __name__ == '__main__':
     parser.add_argument(
         '--model_path', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0', help='llm path')
     parser.add_argument(
-        '--dataset_path', type=str, required=True, help='dataset path')
+        '--data_path', type=str, required=True, help='dataset path')
     parser.add_argument(
         '--num_event_types', type=int, required=True, help='number of event types')
     parser.add_argument(
-        '--temporal_emb_type', type=str, default='positional', choices=['positional', 'linear'],
+        '--temporal_emb_type', type=str, default='positional', choices=['linear', 'positional', 'shifted'],
         help='temporal embedding type')
     parser.add_argument(
         '--temporal_emb_first', action='store_true', help='temporal embedding first or not')
@@ -52,7 +52,11 @@ if __name__ == '__main__':
     parser.add_argument(
         '--learning_rate', type=float, default=5e-4, help='larning rate')
     parser.add_argument(
-        '--num_epochs', type=int, default=1, help='number of epochs')
+        '--lr_scheduler_type', type=str, default='constant', help='learning rate scheduler type')
+    parser.add_argument(
+        '--num_train_epochs', type=int, default=1, help='number of training epochs')
+    parser.add_argument(
+        '--warmup_ratio', type=float, default=0, help='warmup ratio')
     parser.add_argument(
         '--beta_type', type=float, default=1, help='loss coefficient of the event type prediction')
     parser.add_argument(
@@ -66,7 +70,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     print(f'args: {args}')
     transformers.set_seed(args.seed)
-    base_dataset_name = os.path.basename(args.dataset_path).replace('_few_shot', '')
+    base_dataset_name = os.path.basename(args.data_path).replace('_few_shot', '')
     prompt = get_prompt(dataset_name=base_dataset_name, event_time_first=args.temporal_emb_first)
     if args.no_prompt:
         prompt = ''
@@ -117,9 +121,9 @@ if __name__ == '__main__':
     print(f'model: {model}')
 
     # Load the dataset
-    dataset_train = TPPLLMDataset(f'{args.dataset_path}/train.json')
-    dataset_val = TPPLLMDataset(f'{args.dataset_path}/dev.json')
-    dataset_test = TPPLLMDataset(f'{args.dataset_path}/test.json')
+    dataset_train = TPPLLMDataset(f'{args.data_path}/train.json')
+    dataset_val = TPPLLMDataset(f'{args.data_path}/dev.json')
+    dataset_test = TPPLLMDataset(f'{args.data_path}/test.json')
     dataloader_train = DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn)
     dataloader_val = DataLoader(dataset_val, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate_fn)
     dataloader_test = DataLoader(dataset_test, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collate_fn)
@@ -127,7 +131,6 @@ if __name__ == '__main__':
     # Train and test the model
     runner = TPPLLMRunner(
         model=model,
-        learning_rate=args.learning_rate,
         beta_type=args.beta_type,
         beta_time=args.beta_time,
         device=args.device,
@@ -136,5 +139,8 @@ if __name__ == '__main__':
         dataloader_train=dataloader_train,
         dataloader_val=dataloader_val,
         dataloader_test=dataloader_test,
-        num_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        lr_scheduler_type=args.lr_scheduler_type,
+        num_train_epochs=args.num_train_epochs,
+        warmup_ratio=args.warmup_ratio,
     )
